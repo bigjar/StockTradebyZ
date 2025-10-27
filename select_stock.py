@@ -33,8 +33,79 @@ def load_data(data_dir: Path, codes: Iterable[str]) -> Dict[str, pd.DataFrame]:
             logger.warning("%s 不存在，跳过", fp.name)
             continue
         df = pd.read_csv(fp, parse_dates=["date"]).sort_values("date")
+        # 检查数据是否为空或只有标题行
+        if df.empty or df["date"].isna().all():
+            logger.warning("%s 数据为空，跳过", fp.name)
+            continue
         frames[code] = df
     return frames
+
+
+def load_stock_info(stocklist_path: Path) -> Dict[str, Dict[str, str]]:
+    """加载股票信息（代码、名称、地区、行业）"""
+    stock_info: Dict[str, Dict[str, str]] = {}
+    if not stocklist_path.exists():
+        logger.warning("股票列表文件 %s 不存在，无法加载股票信息", stocklist_path)
+        return stock_info
+    
+    try:
+        df = pd.read_csv(stocklist_path, dtype=str)
+        # 尝试不同的列名
+        code_col = None
+        name_col = None
+        area_col = None
+        industry_col = None
+        
+        for col in ["symbol", "ts_code", "code"]:
+            if col in df.columns:
+                code_col = col
+                break
+        
+        for col in ["name", "名称"]:
+            if col in df.columns:
+                name_col = col
+                break
+        
+        for col in ["area", "地区", "地域"]:
+            if col in df.columns:
+                area_col = col
+                break
+        
+        for col in ["industry", "行业", "行业分类"]:
+            if col in df.columns:
+                industry_col = col
+                break
+        
+        if code_col and name_col:
+            # 构建需要的列列表
+            columns = [code_col, name_col]
+            if area_col:
+                columns.append(area_col)
+            if industry_col:
+                columns.append(industry_col)
+            
+            df = df[columns].dropna(subset=[code_col, name_col])
+            df[code_col] = df[code_col].astype(str).str.zfill(6)
+            # 只保留6位数字代码
+            df = df[df[code_col].str.match(r'^\d{6}$')]
+            
+            # 构建字典
+            for _, row in df.iterrows():
+                code = row[code_col]
+                info = {"name": row[name_col]}
+                if area_col and area_col in row:
+                    info["area"] = row[area_col]
+                if industry_col and industry_col in row:
+                    info["industry"] = row[industry_col]
+                stock_info[code] = info
+            
+            logger.info("从 %s 加载了 %d 只股票的信息", stocklist_path, len(stock_info))
+        else:
+            logger.warning("无法在 %s 中找到代码和名称列", stocklist_path)
+    except Exception as e:
+        logger.warning("加载股票列表时出错：%s", e)
+    
+    return stock_info
 
 
 def load_config(cfg_path: Path) -> List[Dict[str, Any]]:
@@ -81,9 +152,13 @@ def main():
     p = argparse.ArgumentParser(description="Run selectors defined in configs.json")
     p.add_argument("--data-dir", default="./data", help="CSV 行情目录")
     p.add_argument("--config", default="./configs.json", help="Selector 配置文件")
+    p.add_argument("--stocklist", default="./stocklist.csv", help="股票列表文件（用于获取股票名称）")
     p.add_argument("--date", help="交易日 YYYY-MM-DD；缺省=数据最新日期")
     p.add_argument("--tickers", default="all", help="'all' 或逗号分隔股票代码列表")
     args = p.parse_args()
+
+    # --- 加载股票信息 ---
+    stock_info = load_stock_info(Path(args.stocklist))
 
     # --- 加载行情 ---
     data_dir = Path(args.data_dir)
@@ -105,12 +180,15 @@ def main():
         logger.error("未能加载任何行情数据")
         sys.exit(1)
 
-    trade_date = (
-        pd.to_datetime(args.date)
-        if args.date
-        else max(df["date"].max() for df in data.values())
-    )
-    if not args.date:
+    if args.date:
+        trade_date = pd.to_datetime(args.date)
+    else:
+        # 计算所有有效数据的最大日期
+        dates = [df["date"].max() for df in data.values() if not df.empty and df["date"].notna().any()]
+        if not dates:
+            logger.error("所有数据都没有有效的日期")
+            sys.exit(1)
+        trade_date = max(dates)
         logger.info("未指定 --date，使用最近日期 %s", trade_date.date())
 
     # --- 加载 Selector 配置 ---
@@ -133,7 +211,28 @@ def main():
         logger.info("============== 选股结果 [%s] ==============", alias)
         logger.info("交易日: %s", trade_date.date())
         logger.info("符合条件股票数: %d", len(picks))
-        logger.info("%s", ", ".join(picks) if picks else "无符合条件股票")
+        
+        if picks:
+            # 格式化输出：每个股票一行显示
+            for idx, code in enumerate(picks, 1):
+                info = stock_info.get(code, {})
+                name = info.get("name", "")
+                area = info.get("area", "")
+                industry = info.get("industry", "")
+                
+                if name or area or industry:
+                    parts = [f"{idx}.", code]
+                    if name:
+                        parts.append(name)
+                    if area:
+                        parts.append(f"({area})")
+                    if industry:
+                        parts.append(f"[{industry}]")
+                    logger.info("  %s", " ".join(parts))
+                else:
+                    logger.info("  %d. %s", idx, code)
+        else:
+            logger.info("无符合条件股票")
 
 
 if __name__ == "__main__":
